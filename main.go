@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"regexp"
 
 	// DNS server
 	"github.com/miekg/dns"
@@ -48,6 +49,8 @@ type Service struct {
 	IPAddress     string
 }
 
+const TraefikLabelRegex = "traefik.http.routers.([\\w\\-\\_]+).rule=Host\\(`((?:(?:[a-zA-Z]|[a-zA-Z][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*(?:[A-Za-z]|[A-Za-z][A-Za-z0-9\\-]*[A-Za-z0-9]))`\\)"
+
 func discover() []Service {
 	log.Info().Msg("Discovering services...")
 	var discovered []Service
@@ -64,21 +67,35 @@ func discover() []Service {
 		return nil
 	}
 
-	for _, container := range containers {
+	traefikRe := regexp.MustCompile(TraefikLabelRegex)
 
+	for _, container := range containers {
+		// Try autodns label first
 		hostname, ok := container.Labels["com.autodns.hostname"]
-		if !ok {
-			log.Debug().Msgf("Container `%s` does not have `com.autodns.hostname` label, skipping", container.Names[0])
+
+		// If autodns label is not set, check Traefik labels
+		if !ok || hostname == "" {
+			for label, value := range container.Labels {
+				matches := traefikRe.FindStringSubmatch(label + "=" + value)
+				if len(matches) == 3 {
+					hostname = matches[2] // 0 is the full match, 1 is the router name, 2 is the hostname
+					log.Debug().Msgf("Extracted Traefik hostname '%s' from container '%s'", hostname, container.Names[0])
+					break
+				}
+			}
+		}
+
+		// If still no hostname, skip this container
+		if hostname == "" {
+			log.Debug().Msgf("Container `%s` does not have autodns or Traefik hostname, skipping", container.Names[0])
 			continue
 		}
 
-		// The container's network the user wants to get the IP from
+		// Network selection
 		network, ok := container.Labels["com.autodns.network"]
 		if !ok {
-			network = "bridge" // Default to bridge network if not specified
+			network = "bridge"
 		}
-
-		// Ensure the container really is on the specified network
 		if _, exists := container.NetworkSettings.Networks[network]; !exists {
 			log.Warn().Msgf("Container `%s` is not on network `%s`, skipping", container.Names[0], network)
 			continue
@@ -91,7 +108,10 @@ func discover() []Service {
 		})
 	}
 
-	log.Info().Msgf("Discovered %d services", len(discovered))
+	log.Info().Msgf("Discovered %d services:", len(discovered))
+	for _, service := range discovered {
+		log.Info().Msgf(" - %s (%s) -> %s", service.ContainerName, service.HostnameLabel, service.IPAddress)
+	}
 	return discovered
 }
 
