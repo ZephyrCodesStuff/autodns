@@ -1,0 +1,16 @@
+services:
+  autodns:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/zephyrcodesstuff/autodns:latest
+    container_name: autodns
+    restart: unless-stopped
+    user: root
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=UTC
