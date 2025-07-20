@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strings"
 
 	// DNS server
 	"github.com/miekg/dns"
@@ -51,43 +52,122 @@ type Service struct {
 
 const TraefikLabelRegex = "traefik.http.routers.([\\w\\-\\_]+).rule=Host\\(`((?:(?:[a-zA-Z]|[a-zA-Z][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*(?:[A-Za-z]|[A-Za-z][A-Za-z0-9\\-]*[A-Za-z0-9]))`\\)"
 
-func discover() []Service {
-	log.Info().Msg("Discovering services...")
-	var discovered []Service
-
+func getContainers() ([]container.Summary, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create Docker client")
-		return nil
+		return nil, err
 	}
 
 	containers, err := cli.ContainerList(context.Background(), container.ListOptions{All: true})
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to list Docker containers")
+		return nil, err
+	}
+
+	return containers, nil
+}
+
+func discoverTraefik() *Service {
+	log.Info().Msg("Searching for Traefik services...")
+
+	containers, err := getContainers()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to get Docker containers")
 		return nil
 	}
+
+	for _, container := range containers {
+		// Search for containers where the image is `traefik`
+		imageName := strings.Split(container.Image, ":")[0] // Get the image name without tag
+
+		if imageName != "traefik" {
+			continue
+		}
+
+		// Return the IP address
+		network, ok := container.Labels["com.autodns.network"]
+		if !ok {
+			network = "bridge" // Default to bridge network if not specified
+		}
+
+		// Ensure it has either the given network or the default bridge network
+		if _, exists := container.NetworkSettings.Networks[network]; !exists {
+			log.Warn().Msgf("Container `%s` is not on network `%s`, skipping", container.Names[0], network)
+			continue
+		}
+
+		// Return the IP in that network
+		ip := container.NetworkSettings.Networks[network].IPAddress
+		if ip == "" {
+			log.Warn().Msgf("Container `%s` does not have an IP address in network `%s`, skipping", container.Names[0], network)
+			continue
+		}
+
+		log.Info().Msgf("Found Traefik service in container `%s` with IP `%s` on network `%s`", container.Names[0], ip, network)
+		return &Service{
+			ContainerName: container.Names[0],
+			HostnameLabel: "traefik",
+			IPAddress:     ip,
+		}
+	}
+
+	return nil
+}
+
+func discover() []Service {
+	log.Info().Msg("Discovering services...")
+	var discovered []Service
+
+	containers, err := getContainers()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to get Docker containers")
+		return nil
+	}
+
+	// Attempt to discover Traefik first
+	traefikIP := discoverTraefik()
 
 	traefikRe := regexp.MustCompile(TraefikLabelRegex)
 
 	for _, container := range containers {
+
 		// Try autodns label first
 		hostname, ok := container.Labels["com.autodns.hostname"]
 
 		// If autodns label is not set, check Traefik labels
+		routed := false
 		if !ok || hostname == "" {
 			for label, value := range container.Labels {
 				matches := traefikRe.FindStringSubmatch(label + "=" + value)
 				if len(matches) == 3 {
 					hostname = matches[2] // 0 is the full match, 1 is the router name, 2 is the hostname
-					log.Debug().Msgf("Extracted Traefik hostname '%s' from container '%s'", hostname, container.Names[0])
-					break
+					log.Debug().Msgf("Extracted Traefik hostname `%s` for service `%s` from container `%s`", hostname, matches[1], container.Names[0])
+
+					if traefikIP == nil {
+						log.Warn().Msgf("Container `%s` has Traefik hostname `%s`, but no Traefik service discovered, skipping", container.Names[0], hostname)
+						continue
+					}
+
+					// Route this service to Traefik
+					discovered = append(discovered, Service{
+						ContainerName: container.Names[0],
+						HostnameLabel: hostname,
+						IPAddress:     traefikIP.IPAddress,
+					})
+
+					log.Debug().Msgf("Container `%s` has Traefik hostname `%s`, routing to Traefik IP `%s`", container.Names[0], hostname, traefikIP.IPAddress)
+					routed = true
+					continue
 				}
 			}
 		}
 
+		// Skip to the next container if routed to Traefik
+		if routed {
+			continue
+		}
+
 		// If still no hostname, skip this container
 		if hostname == "" {
-			log.Debug().Msgf("Container `%s` does not have autodns or Traefik hostname, skipping", container.Names[0])
 			continue
 		}
 
