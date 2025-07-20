@@ -47,7 +47,7 @@ func makeResponse(h string, ip net.IP) *dns.Msg {
 type Service struct {
 	ContainerName string
 	HostnameLabel string
-	IPAddress     string
+	IPAddress     net.IP
 }
 
 const TraefikLabelRegex = "traefik.http.routers.([\\w\\-\\_]+).rule=Host\\(`((?:(?:[a-zA-Z]|[a-zA-Z][a-zA-Z0-9\\-]*[a-zA-Z0-9])\\.)*(?:[A-Za-z]|[A-Za-z][A-Za-z0-9\\-]*[A-Za-z0-9]))`\\)"
@@ -83,6 +83,17 @@ func discoverTraefik() *Service {
 			continue
 		}
 
+		// Check if the container wants its own IP address
+		ipAddressLabel, ok := container.Labels["com.autodns.ip"]
+		if ok && ipAddressLabel != "" {
+			log.Info().Msgf("Container `%s` has its own IP address specified: `%s`", container.Names[0], ipAddressLabel)
+			return &Service{
+				ContainerName: container.Names[0],
+				HostnameLabel: "traefik",
+				IPAddress:     net.ParseIP(ipAddressLabel),
+			}
+		}
+
 		// Return the IP address
 		network, ok := container.Labels["com.autodns.network"]
 		if !ok {
@@ -106,7 +117,7 @@ func discoverTraefik() *Service {
 		return &Service{
 			ContainerName: container.Names[0],
 			HostnameLabel: "traefik",
-			IPAddress:     ip,
+			IPAddress:     net.ParseIP(ip),
 		}
 	}
 
@@ -171,6 +182,18 @@ func discover() []Service {
 			continue
 		}
 
+		// Check if the container wants its own IP address
+		ipAddressLabel, ok := container.Labels["com.autodns.ip"]
+		if ok && ipAddressLabel != "" {
+			log.Info().Msgf("Container `%s` has its own IP address specified: `%s`", container.Names[0], ipAddressLabel)
+			discovered = append(discovered, Service{
+				ContainerName: container.Names[0],
+				HostnameLabel: hostname,
+				IPAddress:     net.ParseIP(ipAddressLabel),
+			})
+			continue
+		}
+
 		// Network selection
 		network, ok := container.Labels["com.autodns.network"]
 		if !ok {
@@ -184,7 +207,7 @@ func discover() []Service {
 		discovered = append(discovered, Service{
 			ContainerName: container.Names[0],
 			HostnameLabel: hostname,
-			IPAddress:     container.NetworkSettings.Networks[network].IPAddress,
+			IPAddress:     net.ParseIP(container.NetworkSettings.Networks[network].IPAddress),
 		})
 	}
 
@@ -228,7 +251,7 @@ func main() {
 	// Build a map for quick lookup
 	serviceMap := make(map[string]string)
 	for _, service := range services {
-		serviceMap[service.HostnameLabel+"."] = service.IPAddress
+		serviceMap[service.HostnameLabel+"."] = service.IPAddress.String()
 	}
 
 	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
